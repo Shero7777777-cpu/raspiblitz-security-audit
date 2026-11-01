@@ -1,0 +1,24 @@
+# Known Limitations
+
+This alpha-review prototype has the following known limitations:
+
+1. No validation on a real RaspiBlitz has been performed.
+2. Historical static review findings remain BLOCKED until independently
+   resolved for a target deployment.
+3. Dynamic subprocess command construction requires review.
+4. Runtime read-only behavior has not been verified.
+5. Runtime privacy redaction has not been verified.
+6. Effective firewall packet behavior has not been verified.
+7. SSH anti-lockout has not been verified.
+8. Public reachability has not been verified.
+9. Firewall apply is not implemented.
+10. Rollback and production hardening are not implemented.
+11. Some source mappings contain illustrative port placeholders.
+12. Modules may classify services inconsistently until mappings
+    are reviewed and normalized for the target environment.
+13. Historical WSL regression results do not validate later edits.
+14. Host-specific diagnostic output can contain sensitive metadata.
+15. Source review findings are not evidence of current production safety.
+
+This project must not be represented as production-ready or as
+having passed a real RaspiBlitz security validation.

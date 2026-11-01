@@ -1,0 +1,32 @@
+{
+  "interfaces": [
+    {
+      "name": "eth0",
+      "address": "192.0.2.10/24"
+    },
+    {
+      "name": "tailscale0",
+      "address": "100.64.0.10/32"
+    }
+  ],
+  "services": [
+    {
+      "name": "sshd",
+      "protocol": "tcp",
+      "port": 2222,
+      "bind": "0.0.0.0"
+    },
+    {
+      "name": "bitcoind-p2p",
+      "protocol": "tcp",
+      "port": 8300,
+      "bind": "0.0.0.0"
+    },
+    {
+      "name": "electrs",
+      "protocol": "tcp",
+      "port": 50000,
+      "bind": "0.0.0.0"
+    }
+  ]
+}
