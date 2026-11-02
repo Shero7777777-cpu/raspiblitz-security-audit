@@ -83,21 +83,87 @@ def parse_nft(raw):
             "nat_chains_present": "NOT_VERIFIED",
         }
 
+    if not isinstance(data, dict) or not isinstance(data.get("nftables"), list):
+        return {
+            "status": "SCHEMA_ERROR",
+            "input_base_chains": [],
+            "nat_chains_present": "NOT_VERIFIED",
+        }
+
     chains = []
     nat = False
 
     for item in data.get("nftables", []):
+        if not isinstance(item, dict):
+            return {
+                "status": "SCHEMA_ERROR",
+                "input_base_chains": [],
+                "nat_chains_present": "NOT_VERIFIED",
+            }
         chain = item.get("chain")
+        if "chain" in item and not isinstance(chain, dict):
+            return {
+                "status": "SCHEMA_ERROR",
+                "input_base_chains": [],
+                "nat_chains_present": "NOT_VERIFIED",
+            }
         if not isinstance(chain, dict):
             continue
 
+        identity_fields = {"family", "table", "name", "type", "hook"}
+        if not any(field in chain for field in identity_fields):
+            return {
+                "status": "SCHEMA_ERROR",
+                "input_base_chains": [],
+                "nat_chains_present": "NOT_VERIFIED",
+            }
+        for field in ("family", "table", "name"):
+            if field in chain and (
+                not isinstance(chain[field], str) or not chain[field]
+            ):
+                return {
+                    "status": "SCHEMA_ERROR",
+                    "input_base_chains": [],
+                    "nat_chains_present": "NOT_VERIFIED",
+                }
+
         hook = chain.get("hook")
-        if hook in {"prerouting", "postrouting"}:
+        has_type = "type" in chain
+        chain_type = chain.get("type")
+        if has_type and (
+            not isinstance(chain_type, str)
+            or chain_type not in {"filter", "nat", "route"}
+        ):
+            return {
+                "status": "SCHEMA_ERROR",
+                "input_base_chains": [],
+                "nat_chains_present": "NOT_VERIFIED",
+            }
+        if hook is not None and not isinstance(hook, str):
+            return {
+                "status": "SCHEMA_ERROR",
+                "input_base_chains": [],
+                "nat_chains_present": "NOT_VERIFIED",
+            }
+        if hook is not None and not has_type:
+            return {
+                "status": "SCHEMA_ERROR",
+                "input_base_chains": [],
+                "nat_chains_present": "NOT_VERIFIED",
+            }
+        if has_type and hook is None:
+            return {
+                "status": "SCHEMA_ERROR",
+                "input_base_chains": [],
+                "nat_chains_present": "NOT_VERIFIED",
+            }
+        if has_type and chain_type == "nat":
             nat = True
         if hook == "input":
             chains.append({
                 "family": chain.get("family", "UNKNOWN"),
-                "type": chain.get("type", "UNKNOWN"),
+                "type": chain_type,
+                "hook": hook,
                 "priority": chain.get("prio", "UNKNOWN"),
                 "policy": chain.get("policy", "UNKNOWN"),
                 "rule_evaluation": "NOT_VERIFIED",

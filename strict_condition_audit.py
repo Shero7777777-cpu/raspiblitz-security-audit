@@ -227,6 +227,7 @@ def validate_rule(tokens, family):
 
 def parse_save(raw):
     table = None
+    committed = False
     rules = []
     errors = 0
 
@@ -234,11 +235,18 @@ def parse_save(raw):
         line = line.strip()
 
         if line.startswith("*"):
+            if table is not None and not committed:
+                errors += 1
             table = line[1:]
+            committed = False
             continue
 
         if line == "COMMIT":
+            if table is None or committed:
+                errors += 1
+                continue
             table = None
+            committed = True
             continue
 
         if table != "filter" or not line.startswith("-A "):
@@ -255,6 +263,9 @@ def parse_save(raw):
             continue
 
         rules.append((tokens[1], tokens[2:]))
+
+    if table is not None and not committed:
+        errors += 1
 
     return rules, errors
 

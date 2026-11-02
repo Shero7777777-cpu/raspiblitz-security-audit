@@ -48,6 +48,7 @@ def run(argv):
 
 def parse_save(raw):
     table = None
+    committed = False
     chains = {}
     policies = {}
     errors = 0
@@ -56,10 +57,17 @@ def parse_save(raw):
         line = line.strip()
 
         if line.startswith("*"):
+            if table is not None and not committed:
+                errors += 1
             table = line[1:]
+            committed = False
             continue
         if line == "COMMIT":
+            if table is None or committed:
+                errors += 1
+                continue
             table = None
+            committed = True
             continue
         if table != "filter":
             continue
@@ -92,32 +100,71 @@ def parse_save(raw):
             chain = tokens[1]
             chains.setdefault(chain, []).append(tokens[2:])
 
+    if table is not None and not committed:
+        errors += 1
+
     return chains, policies, errors
 
 def target_info(tokens, chain_names):
-    indices = [
-        i for i, token in enumerate(tokens)
-        if token in {"-j", "--jump", "-g", "--goto"}
-    ]
+    target_options = {"-j", "--jump", "-g", "--goto"}
+    value_options = {
+        "-p", "--protocol", "-s", "--source", "-d", "--destination",
+        "-i", "--in-interface", "-o", "--out-interface", "-m",
+        "--match", "-c", "--comment", "--dport", "--sport",
+        "--dports", "--sports", "--tcp-flags", "--ctstate", "--state",
+    }
+    targets = []
+    malformed = False
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in target_options:
+            if index + 1 >= len(tokens) or tokens[index + 1].startswith("-"):
+                malformed = True
+                index += 1
+                continue
+            targets.append((token, tokens[index + 1]))
+            index += 2
+            continue
+        if token in value_options:
+            needed = 2 if token != "--tcp-flags" else 3
+            if index + needed - 1 >= len(tokens):
+                malformed = True
+                index += 1
+                continue
+            index += needed
+            continue
+        index += 1
 
-    if len(indices) != 1:
-        return {
-            "classification": "UNSUPPORTED",
-            "target_type": "MISSING_OR_MULTIPLE",
-            "flow": "NOT_VERIFIED",
-        }
-
-    index = indices[0]
-
-    if index + 1 >= len(tokens):
+    if malformed:
         return {
             "classification": "PARSE_ERROR",
-            "target_type": "MISSING_VALUE",
+            "target_type": "MALFORMED_TARGET",
             "flow": "NOT_VERIFIED",
         }
 
-    target = tokens[index + 1]
-    kind = "GOTO" if tokens[index] in {"-g", "--goto"} else "JUMP"
+    if len(targets) > 1:
+        return {
+            "classification": "PARSE_ERROR",
+            "target_type": "MULTIPLE_TARGETS",
+            "flow": "NOT_VERIFIED",
+        }
+
+    if not targets:
+        if "-c" in tokens:
+            return {
+                "classification": "COUNTER_ONLY",
+                "target_type": "NONE",
+                "flow": "NOT_VERIFIED",
+            }
+        return {
+            "classification": "UNSUPPORTED",
+            "target_type": "NO_TARGET",
+            "flow": "NOT_VERIFIED",
+        }
+
+    option, target = targets[0]
+    kind = "GOTO" if option in {"-g", "--goto"} else "JUMP"
 
     if target in chain_names:
         classification = "USER_CHAIN"
@@ -141,6 +188,7 @@ def inspect_rules(chains):
         "VERDICT": 0,
         "USER_CHAIN": 0,
         "EXTENSION": 0,
+        "COUNTER_ONLY": 0,
         "UNSUPPORTED": 0,
         "PARSE_ERROR": 0,
     }
@@ -207,7 +255,7 @@ def self_test():
         "negation_detected": rows[7]["negation_present"],
         "unknown_target": rows[8]["classification"] == "UNSUPPORTED",
         "missing_target": rows[9]["classification"] == "PARSE_ERROR",
-        "multiple_targets": rows[10]["classification"] == "UNSUPPORTED",
+        "multiple_targets": rows[10]["classification"] == "PARSE_ERROR",
         "return_verdict": rows[11]["target_type"] == "RETURN",
         "rule_order": rows[0]["position"] == 1 and rows[1]["position"] == 2,
         "fail_closed": all(
