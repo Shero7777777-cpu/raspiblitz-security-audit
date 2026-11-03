@@ -6,7 +6,11 @@ import ipaddress
 import json
 import os
 import re
+import stat
 import shutil
+import selectors
+import signal
+import time
 import subprocess
 import sys
 
@@ -29,37 +33,146 @@ SSH_PATHS = (
     "/sbin/sshd",
 )
 
-def run(argv, allow_nonzero=False):
-    executable = shutil.which(argv[0])
-    if not executable:
-        return "UNAVAILABLE", "", None
 
-    try:
-        proc = subprocess.run(
-            [executable, *argv[1:]],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-            env=ENV,
+_TRUSTED_EXEC_DIRS = ("/usr/sbin", "/usr/bin", "/sbin", "/bin")
+
+
+def _resolve_trusted_executable(command):
+    """Fail closed unless the resolved executable path is root-controlled."""
+    if not isinstance(command, str) or not command or "\x00" in command:
+        return None
+
+    if os.path.isabs(command):
+        if os.path.normpath(command) != command:
+            return None
+        if os.path.dirname(command) not in _TRUSTED_EXEC_DIRS:
+            return None
+        candidates = (command,)
+    elif "/" in command or "\\" in command or command in (".", ".."):
+        return None
+    else:
+        candidates = tuple(
+            os.path.join(directory, command)
+            for directory in _TRUSTED_EXEC_DIRS
         )
-    except subprocess.TimeoutExpired:
-        return "TIMEOUT", "", None
-    except OSError:
-        return "ERROR", "", None
 
-    if len(proc.stdout) > MAX_BYTES:
-        return "OUTPUT_LIMIT", "", proc.returncode
+    for candidate in candidates:
+        current = candidate
+        visited = set()
 
-    if proc.returncode != 0 and not allow_nonzero:
-        return "ERROR", "", proc.returncode
+        for _ in range(40):
+            if current in visited:
+                break
+            visited.add(current)
 
-    return (
-        "OK",
-        proc.stdout.decode("utf-8", errors="replace"),
-        proc.returncode,
-    )
+            parts = current.split("/")[1:]
+            cursor = "/"
+
+            try:
+                root_info = os.lstat("/")
+                if (
+                    not stat.S_ISDIR(root_info.st_mode)
+                    or root_info.st_uid != 0
+                    or root_info.st_mode & 0o022
+                ):
+                    break
+
+                for index, component in enumerate(parts):
+                    cursor = os.path.join(cursor, component)
+                    info = os.lstat(cursor)
+
+                    if info.st_uid != 0:
+                        raise OSError("untrusted owner")
+
+                    if stat.S_ISLNK(info.st_mode):
+                        target = os.readlink(cursor)
+                        if any(
+                            component in (".", "..")
+                            for component in target.split("/")
+                        ):
+                            raise OSError("unsafe symlink target")
+                        remaining = parts[index + 1:]
+                        current = os.path.normpath(
+                            os.path.join(
+                                os.path.dirname(cursor),
+                                target,
+                                *remaining,
+                            )
+                        )
+                        if not os.path.isabs(current):
+                            raise OSError("invalid symlink")
+                        break
+
+                    if info.st_mode & 0o022:
+                        raise OSError("writable path")
+
+                    if index < len(parts) - 1:
+                        if not stat.S_ISDIR(info.st_mode):
+                            raise OSError("non-directory component")
+                    elif (
+                        not stat.S_ISREG(info.st_mode)
+                        or not info.st_mode & 0o111
+                    ):
+                        raise OSError("not executable")
+                else:
+                    if os.path.dirname(cursor) in _TRUSTED_EXEC_DIRS:
+                        return cursor
+                    break
+
+            except (OSError, ValueError):
+                break
+
+    return None
+
+
+def _bounded_collect(argv, limit, env):
+    deadline=time.monotonic()+10.0; proc=None; selector=None; completed=False
+    try:
+        proc=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env,close_fds=True,start_new_session=True)
+        selector=selectors.DefaultSelector(); selector.register(proc.stdout,selectors.EVENT_READ); output=bytearray()
+        while True:
+            remaining=deadline-time.monotonic()
+            if remaining<=0:return "TIMEOUT",b"",None
+            if not selector.select(remaining):return "TIMEOUT",b"",None
+            count=min(65536,limit+1-len(output))
+            if count<=0:return "OUTPUT_LIMIT",b"",None
+            chunk=os.read(proc.stdout.fileno(),count)
+            if not chunk:break
+            output.extend(chunk)
+            if len(output)>limit:
+                rc=proc.poll()
+                if rc is not None: completed=True; return "OUTPUT_LIMIT",b"",rc
+                return "OUTPUT_LIMIT",b"",None
+        remaining=deadline-time.monotonic()
+        if remaining<=0:return "TIMEOUT",b"",None
+        try: rc=proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:return "TIMEOUT",b"",None
+        completed=True; return "OK",bytes(output),rc
+    except (OSError,ValueError):return "ERROR",b"",None
+    finally:
+        if proc is not None:
+            if not completed:
+                try:os.killpg(proc.pid,signal.SIGKILL)
+                except ProcessLookupError:pass
+                except OSError:
+                    try:proc.kill()
+                    except (OSError,ValueError,RuntimeError):pass
+                try:proc.wait(timeout=0.5)
+                except (OSError,ValueError,RuntimeError,subprocess.TimeoutExpired):pass
+            if proc.stdout is not None:
+                try:proc.stdout.close()
+                except (OSError,ValueError,RuntimeError):pass
+        if selector is not None:
+            try:selector.close()
+            except (OSError,ValueError,RuntimeError):pass
+
+def run(argv, allow_nonzero=False):
+    executable=_resolve_trusted_executable(argv[0])
+    if not executable:return "UNAVAILABLE","",None
+    status,raw,returncode=_bounded_collect([executable,*argv[1:]],MAX_BYTES,ENV)
+    if status!="OK":return status,"",returncode
+    if returncode!=0 and not allow_nonzero:return "ERROR","",returncode
+    return "OK",raw.decode("utf-8",errors="replace"),returncode
 
 def split_endpoint(value):
     """Extract numeric port without exposing address."""
@@ -169,7 +282,7 @@ def ssh_status(entries):
     sshd = next(
         (
             path for path in SSH_PATHS
-            if os.path.isfile(path) and os.access(path, os.X_OK)
+            if _resolve_trusted_executable(path) is not None
         ),
         None,
     )

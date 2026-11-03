@@ -40,6 +40,26 @@ without inspecting its implementation.
 The included mapping candidate must be independently reviewed after
 any modification.
 
+## November 2026 review validation record
+
+Local isolated validation covered bounded subprocess migration in 10/10
+audit modules, source and candidate contract regressions, post-write
+parser regressions, harmless native WSL fixtures, SHA256 verification,
+and a complete Git-diff review. R8B-16A38 through R8B-16A41 exercised
+the four parser fixes and their cross-module consistency, including LOG
+prefix/comment literal text, multiple targets, malformed input, missing
+`COMMIT`, counter-only rules, nft JSON null validation, and NAT chain
+type classification.
+
+These historical local results are not a substitute for reproducible
+testing of the published revision. This repository does not include a
+complete CI harness or a standalone reproducible test suite. For a
+strict no-write syntax check, parse each Python source with `ast.parse()`
+rather than a command that creates `__pycache__`.
+
+Do not run `--audit` on a physical RaspiBlitz before independent source
+review and explicit authorization for an isolated validation plan.
+
 ## Configuration review
 
 The reviewer or an explicitly authorized local agent must:

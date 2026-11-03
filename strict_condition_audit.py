@@ -6,8 +6,13 @@ import ipaddress
 import json
 import re
 import shlex
+import os
+import stat
 import shutil
+import selectors
+import signal
 import subprocess
+import time
 import sys
 
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
@@ -55,6 +60,8 @@ VALUE_OPTIONS = {
     "-g": "TARGET",
     "--goto": "TARGET",
     "--comment": "COMMENT",
+    "--log-prefix": "COMMENT",
+    "-c": "COUNTER",
     "--icmp-type": "ICMP_TYPE",
     "--icmpv6-type": "ICMP_TYPE",
     "--limit": "LIMIT",
@@ -64,32 +71,165 @@ VALUE_OPTIONS = {
     "--dst-type": "ADDRTYPE",
 }
 
+
+_TRUSTED_EXEC_DIRS = ("/usr/sbin", "/usr/bin", "/sbin", "/bin")
+
+
+def _resolve_trusted_executable(command):
+    """Fail closed unless the resolved executable path is root-controlled."""
+    if not isinstance(command, str) or not command or "\x00" in command:
+        return None
+
+    if os.path.isabs(command):
+        if os.path.normpath(command) != command:
+            return None
+        if os.path.dirname(command) not in _TRUSTED_EXEC_DIRS:
+            return None
+        candidates = (command,)
+    elif "/" in command or "\\" in command or command in (".", ".."):
+        return None
+    else:
+        candidates = tuple(
+            os.path.join(directory, command)
+            for directory in _TRUSTED_EXEC_DIRS
+        )
+
+    for candidate in candidates:
+        current = candidate
+        visited = set()
+
+        for _ in range(40):
+            if current in visited:
+                break
+            visited.add(current)
+
+            parts = current.split("/")[1:]
+            cursor = "/"
+
+            try:
+                root_info = os.lstat("/")
+                if (
+                    not stat.S_ISDIR(root_info.st_mode)
+                    or root_info.st_uid != 0
+                    or root_info.st_mode & 0o022
+                ):
+                    break
+
+                for index, component in enumerate(parts):
+                    cursor = os.path.join(cursor, component)
+                    info = os.lstat(cursor)
+
+                    if info.st_uid != 0:
+                        raise OSError("untrusted owner")
+
+                    if stat.S_ISLNK(info.st_mode):
+                        target = os.readlink(cursor)
+                        if any(
+                            component in (".", "..")
+                            for component in target.split("/")
+                        ):
+                            raise OSError("unsafe symlink target")
+                        remaining = parts[index + 1:]
+                        current = os.path.normpath(
+                            os.path.join(
+                                os.path.dirname(cursor),
+                                target,
+                                *remaining,
+                            )
+                        )
+                        if not os.path.isabs(current):
+                            raise OSError("invalid symlink")
+                        break
+
+                    if info.st_mode & 0o022:
+                        raise OSError("writable path")
+
+                    if index < len(parts) - 1:
+                        if not stat.S_ISDIR(info.st_mode):
+                            raise OSError("non-directory component")
+                    elif (
+                        not stat.S_ISREG(info.st_mode)
+                        or not info.st_mode & 0o111
+                    ):
+                        raise OSError("not executable")
+                else:
+                    if os.path.dirname(cursor) in _TRUSTED_EXEC_DIRS:
+                        return cursor
+                    break
+
+            except (OSError, ValueError):
+                break
+
+    return None
+
+
+def _bounded_collect(argv, limit, env):
+    deadline = time.monotonic() + 10.0
+    proc = selector = None
+    completed = False
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
+            close_fds=True, start_new_session=True)
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        output = bytearray()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "TIMEOUT", b"", None
+            if not selector.select(remaining):
+                return "TIMEOUT", b"", None
+            count = min(65536, limit + 1 - len(output))
+            if count <= 0:
+                return "OUTPUT_LIMIT", b"", None
+            chunk = os.read(proc.stdout.fileno(), count)
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > limit:
+                return "OUTPUT_LIMIT", b"", None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "TIMEOUT", b"", None
+        try:
+            returncode = proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            return "TIMEOUT", b"", None
+        completed = True
+        return "OK", bytes(output), returncode
+    except (OSError, ValueError):
+        return "ERROR", b"", None
+    finally:
+        if proc is not None:
+            if not completed:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    try: proc.kill()
+                    except (OSError, ValueError, RuntimeError): pass
+                try: proc.wait(timeout=0.5)
+                except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired): pass
+            if proc.stdout is not None:
+                try: proc.stdout.close()
+                except (OSError, ValueError, RuntimeError): pass
+        if selector is not None:
+            try: selector.close()
+            except (OSError, ValueError, RuntimeError): pass
+
+
 def run(argv):
-    exe = shutil.which(argv[0])
+    exe = _resolve_trusted_executable(argv[0])
     if not exe:
         return "UNAVAILABLE", ""
-
-    try:
-        p = subprocess.run(
-            [exe, *argv[1:]],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-            env=ENV,
-        )
-    except subprocess.TimeoutExpired:
-        return "TIMEOUT", ""
-    except OSError:
+    status, raw, returncode = _bounded_collect([exe, *argv[1:]], LIMIT, ENV)
+    if status != "OK":
+        return status, ""
+    if returncode != 0:
         return "ERROR", ""
-
-    if len(p.stdout) > LIMIT:
-        return "OUTPUT_LIMIT", ""
-    if p.returncode != 0:
-        return "ERROR", ""
-
-    return "OK", p.stdout.decode("utf-8", "replace")
+    return "OK", raw.decode("utf-8", "replace")
 
 def valid_port(value):
     if not re.fullmatch(r"\d+(?::\d+)?", value):
@@ -172,6 +312,7 @@ def validate_rule(tokens, family):
     unsupported = []
     seen = []
     negations = 0
+    target_count = 0
     index = 0
 
     while index < len(tokens):
@@ -191,23 +332,31 @@ def validate_rule(tokens, family):
             index += 1
             continue
 
-        if index + 1 >= len(tokens):
+        needed = 2 if kind == "COUNTER" else 1
+        if index + needed >= len(tokens):
             errors.append("MISSING_VALUE")
             index += 1
             continue
 
-        value = tokens[index + 1]
-
-        if value == "!" or value.startswith("--"):
+        values = tokens[index + 1:index + 1 + needed]
+        if any(value == "!" or value.startswith("--") for value in values):
             errors.append("MISSING_VALUE")
             index += 1
             continue
 
-        if not validate_value(kind, value, family):
+        if kind == "COUNTER":
+            if not all(re.fullmatch(r"[0-9]+", value) for value in values):
+                unsupported.append("UNSUPPORTED_VALUE")
+        elif not validate_value(kind, values[0], family):
             unsupported.append("UNSUPPORTED_VALUE")
 
         seen.append(kind)
-        index += 2
+        if kind == "TARGET":
+            target_count += 1
+        index += 1 + needed
+
+    if target_count > 1:
+        errors.append("MULTIPLE_TARGETS")
 
     if errors:
         status = "PARSE_ERROR"
@@ -228,6 +377,8 @@ def validate_rule(tokens, family):
 def parse_save(raw):
     table = None
     committed = False
+    filter_seen = False
+    filter_committed = False
     rules = []
     errors = 0
 
@@ -238,6 +389,8 @@ def parse_save(raw):
             if table is not None and not committed:
                 errors += 1
             table = line[1:]
+            if table == "filter":
+                filter_seen = True
             committed = False
             continue
 
@@ -245,8 +398,14 @@ def parse_save(raw):
             if table is None or committed:
                 errors += 1
                 continue
+            if table == "filter":
+                filter_committed = True
             table = None
             committed = True
+            continue
+
+        if line.startswith("-A ") and table != "filter":
+            errors += 1
             continue
 
         if table != "filter" or not line.startswith("-A "):
@@ -264,7 +423,11 @@ def parse_save(raw):
 
         rules.append((tokens[1], tokens[2:]))
 
-    if table is not None and not committed:
+    if (
+        (table is not None and not committed)
+        or not filter_seen
+        or not filter_committed
+    ):
         errors += 1
 
     return rules, errors

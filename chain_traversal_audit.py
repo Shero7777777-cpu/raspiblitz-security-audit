@@ -5,8 +5,13 @@ import argparse
 import json
 import re
 import shlex
+import os
+import stat
 import shutil
+import selectors
+import signal
 import subprocess
+import time
 import sys
 
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
@@ -30,31 +35,217 @@ CONDITIONS = {
     "-m": "MATCH_MODULE",
 }
 
-def run(argv):
-    exe = shutil.which(argv[0])
-    if not exe:
-        return "UNAVAILABLE", ""
+
+_TRUSTED_EXEC_DIRS = ("/usr/sbin", "/usr/bin", "/sbin", "/bin")
+
+
+def _resolve_trusted_executable(command):
+    """Fail closed unless the resolved executable path is root-controlled."""
+    if not isinstance(command, str) or not command or "\x00" in command:
+        return None
+
+    if os.path.isabs(command):
+        if os.path.normpath(command) != command:
+            return None
+        if os.path.dirname(command) not in _TRUSTED_EXEC_DIRS:
+            return None
+        candidates = (command,)
+    elif "/" in command or "\\" in command or command in (".", ".."):
+        return None
+    else:
+        candidates = tuple(
+            os.path.join(directory, command)
+            for directory in _TRUSTED_EXEC_DIRS
+        )
+
+    for candidate in candidates:
+        current = candidate
+        visited = set()
+
+        for _ in range(40):
+            if current in visited:
+                break
+            visited.add(current)
+
+            parts = current.split("/")[1:]
+            cursor = "/"
+
+            try:
+                root_info = os.lstat("/")
+                if (
+                    not stat.S_ISDIR(root_info.st_mode)
+                    or root_info.st_uid != 0
+                    or root_info.st_mode & 0o022
+                ):
+                    break
+
+                for index, component in enumerate(parts):
+                    cursor = os.path.join(cursor, component)
+                    info = os.lstat(cursor)
+
+                    if info.st_uid != 0:
+                        raise OSError("untrusted owner")
+
+                    if stat.S_ISLNK(info.st_mode):
+                        target = os.readlink(cursor)
+                        if any(
+                            component in (".", "..")
+                            for component in target.split("/")
+                        ):
+                            raise OSError("unsafe symlink target")
+                        remaining = parts[index + 1:]
+                        current = os.path.normpath(
+                            os.path.join(
+                                os.path.dirname(cursor),
+                                target,
+                                *remaining,
+                            )
+                        )
+                        if not os.path.isabs(current):
+                            raise OSError("invalid symlink")
+                        break
+
+                    if info.st_mode & 0o022:
+                        raise OSError("writable path")
+
+                    if index < len(parts) - 1:
+                        if not stat.S_ISDIR(info.st_mode):
+                            raise OSError("non-directory component")
+                    elif (
+                        not stat.S_ISREG(info.st_mode)
+                        or not info.st_mode & 0o111
+                    ):
+                        raise OSError("not executable")
+                else:
+                    if os.path.dirname(cursor) in _TRUSTED_EXEC_DIRS:
+                        return cursor
+                    break
+
+            except (OSError, ValueError):
+                break
+
+    return None
+
+
+def _bounded_collect(argv, limit, env):
+    deadline = time.monotonic() + 10.0
+    proc = None
+    selector = None
+    completed = False
+
     try:
-        p = subprocess.run(
-            [exe, *argv[1:]],
+        proc = subprocess.Popen(
+            argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-            env=ENV,
+            env=env,
+            close_fds=True,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired:
-        return "TIMEOUT", ""
-    except OSError:
+
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+
+        output = bytearray()
+
+        while True:
+            remaining = deadline - time.monotonic()
+
+            if remaining <= 0:
+                return "TIMEOUT", b"", None
+
+            events = selector.select(remaining)
+
+            if not events:
+                return "TIMEOUT", b"", None
+
+            allowance = limit + 1 - len(output)
+            count = min(65536, allowance)
+
+            if count <= 0:
+                return "OUTPUT_LIMIT", b"", None
+
+            chunk = os.read(proc.stdout.fileno(), count)
+
+            if not chunk:
+                break
+
+            output.extend(chunk)
+
+            if len(output) > limit:
+                return "OUTPUT_LIMIT", b"", None
+
+        remaining = deadline - time.monotonic()
+
+        if remaining <= 0:
+            return "TIMEOUT", b"", None
+
+        try:
+            returncode = proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            return "TIMEOUT", b"", None
+
+        completed = True
+        return "OK", bytes(output), returncode
+
+    except (OSError, ValueError):
+        return "ERROR", b"", None
+
+    finally:
+        if proc is not None:
+            if not completed:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    try:
+                        proc.kill()
+                    except (OSError, ValueError, RuntimeError):
+                        pass
+
+                try:
+                    proc.wait(timeout=0.5)
+                except (
+                    OSError,
+                    ValueError,
+                    RuntimeError,
+                    subprocess.TimeoutExpired,
+                ):
+                    pass
+
+            if proc.stdout is not None:
+                try:
+                    proc.stdout.close()
+                except (OSError, ValueError, RuntimeError):
+                    pass
+
+        if selector is not None:
+            try:
+                selector.close()
+            except (OSError, ValueError, RuntimeError):
+                pass
+
+
+def run(argv):
+    exe = _resolve_trusted_executable(argv[0])
+    if not exe:
+        return "UNAVAILABLE", ""
+
+    status, raw, returncode = _bounded_collect(
+        [exe, *argv[1:]],
+        LIMIT,
+        ENV,
+    )
+
+    if status != "OK":
+        return status, ""
+
+    if returncode != 0:
         return "ERROR", ""
 
-    if len(p.stdout) > LIMIT:
-        return "OUTPUT_LIMIT", ""
-    if p.returncode != 0:
-        return "ERROR", ""
-
-    return "OK", p.stdout.decode("utf-8", "replace")
+    return "OK", raw.decode("utf-8", "replace")
 
 def parse_save(raw):
     table = None
@@ -102,18 +293,37 @@ def parse_save(raw):
             continue
 
         name = tokens[1]
-        chains.setdefault(name, []).append(tokens[2:])
+        rule = tokens[2:]
+        _, kind = rule_target(rule)
+        if kind == "INVALID":
+            parse_errors += 1
+        chains.setdefault(name, []).append(rule)
 
     return chains, policies, parse_errors
 
 def rule_target(tokens):
-    for index, token in enumerate(tokens):
+    target = None
+    kind = "NONE"
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        # LOG prefixes and comments are literal values, not option streams.
+        if token in {"--log-prefix", "--comment"}:
+            if index + 1 >= len(tokens):
+                return None, "INVALID"
+            index += 2
+            continue
         if token in {"-j", "--jump", "-g", "--goto"}:
-            if index + 1 < len(tokens):
-                return tokens[index + 1], (
-                    "GOTO" if token in {"-g", "--goto"} else "JUMP"
-                )
-    return None, "NONE"
+            if index + 1 >= len(tokens) or tokens[index + 1].startswith("-"):
+                return None, "INVALID"
+            if target is not None:
+                return None, "INVALID"
+            target = tokens[index + 1]
+            kind = "GOTO" if token in {"-g", "--goto"} else "JUMP"
+            index += 2
+            continue
+        index += 1
+    return target, kind
 
 def conditions(tokens):
     found = set()

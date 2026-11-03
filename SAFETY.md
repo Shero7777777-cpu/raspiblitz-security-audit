@@ -69,3 +69,12 @@ authorizing any live diagnostic execution.
 
 The author does not need access to the reviewer's private
 configuration or credentials.
+
+## Bounded collection does not authorize live use
+
+The 10-second deadline applies to each subprocess collector, not to an
+entire audit run. Collector bounds and process cleanup do not create an
+apply path, grant trust to LAN/VPN/Tailscale interfaces, verify SSH
+anti-lockout, or evaluate real packet-policy behavior. Independent
+source review is required before any live test, and no production test
+has been performed.

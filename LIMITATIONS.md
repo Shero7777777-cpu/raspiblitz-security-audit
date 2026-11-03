@@ -22,3 +22,12 @@ This alpha-review prototype has the following known limitations:
 
 This project must not be represented as production-ready or as
 having passed a real RaspiBlitz security validation.
+
+## Review architecture limits
+
+There is no central coordinator, no shared whole-audit deadline, and no
+coordinator-level bound on the total JSON report size. Hard process
+isolation through systemd or cgroups has not been verified on a target
+RaspiBlitz. An optional coordinator design was validated only in memory;
+no production coordinator has been implemented. This code is not
+approved for production deployment.

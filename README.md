@@ -75,6 +75,25 @@ Read SAFETY.md, TESTING.md, and LIMITATIONS.md before use.
 These results are historical local-development observations,
 not evidence of successful testing after subsequent source edits.
 
+## November 2026 — bounded execution and parser review update
+
+Ten separate audit modules now use bounded subprocess collectors. Each
+collector reads at most 65,536 bytes at a time, limits captured stdout to
+4 MiB, and uses a monotonic 10-second deadline for that individual
+collector. Child processes run in a separate session with descriptor
+cleanup; timeout and failure cleanup includes process-group termination
+and reaping.
+
+The review also fixed four parser findings: literal `-j` text in LOG
+prefixes and comments is not treated as a target, while multiple real
+targets remain rejected. Additional cross-module offline regressions
+covered malformed input, missing commits, counter rules, targetless
+rules, and supported and unsupported syntax.
+
+These controls support read-only source review only. They do not prove
+runtime safety, effective firewall behavior, SSH anti-lockout, or
+production suitability.
+
 ## License
 
 Distributed under the [MIT License](LICENSE). This license does not
