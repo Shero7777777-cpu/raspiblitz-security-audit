@@ -78,3 +78,16 @@ apply path, grant trust to LAN/VPN/Tailscale interfaces, verify SSH
 anti-lockout, or evaluate real packet-policy behavior. Independent
 source review is required before any live test, and no production test
 has been performed.
+## Offline snapshot file safety
+
+The offline entrypoint opens only explicit paths with `O_NOFOLLOW`, `O_CLOEXEC`,
+and bounded reads, then checks the opened descriptor with `fstat`. It rejects the
+final path component when it is a symlink and rejects directories, FIFOs, sockets,
+and devices. On Linux, `O_NOFOLLOW` does not reject symlinks in parent directory
+components. Reviewers who require that stronger property must place snapshots in a
+reviewed directory tree without symlinked parents.
+
+No automatic collection, firewall or SSH change, external network access, live
+collector invocation, background scheduling, or automatic trust assignment is
+implemented. Parser failures return fixed error codes without paths, input content,
+or raw exceptions.

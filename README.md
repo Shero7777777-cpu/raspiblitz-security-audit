@@ -98,3 +98,27 @@ production suitability.
 
 Distributed under the [MIT License](LICENSE). This license does not
 constitute approval for live execution or production deployment.
+## Offline snapshot review entrypoint
+
+SOURCE REVIEW ONLY — NOT PRODUCTION READY
+
+Python 3 users with read permission for independently obtained snapshot files can run:
+
+    python3 -B auditor.py --review-snapshots [--iptables-v4 FILE] [--iptables-v6 FILE] [--nft-json FILE] [--ufw-text FILE]
+
+At least one input is required. Each option may be supplied once. Supported inputs are
+`iptables-save`/IPv6 save text, nftables JSON, and UFW status text already acquired
+outside this program. The command never collects snapshots, invokes a live collector,
+accesses the network, assigns trusted networks, changes firewall or SSH configuration,
+or schedules background work.
+
+Each file is limited to 4 MiB and all inputs together to 8 MiB. The JSON report is
+limited to 64 KiB. It contains only fixed statuses, counts, and fixed limitations; it
+does not include rules, addresses, chain names, paths, hostnames, usernames, or secrets.
+Exit 0 means only that all supplied inputs completed syntax parsing. It is not a
+firewall or RaspiBlitz security approval.
+
+Existing fixture commands remain available:
+
+    python3 -B auditor.py --fixture fixture.json --audit
+    python3 -B auditor.py --fixture fixture.json --dry-run

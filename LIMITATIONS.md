@@ -31,3 +31,15 @@ isolation through systemd or cgroups has not been verified on a target
 RaspiBlitz. An optional coordinator design was validated only in memory;
 no production coordinator has been implemented. This code is not
 approved for production deployment.
+## Offline review limitations
+
+Successful syntax parsing does not establish effective packet policy, SSH anti-lockout
+protection, or public reachability. These remain `NOT_VERIFIED`; firewall application
+is `NOT_IMPLEMENTED`. UFW text parsing recognizes only its documented status/default
+patterns. There is no OS-level parser watchdog.
+
+This build has not been validated on a physical RaspiBlitz. Live-node testing remains
+blocked until an independent source review confirms read-only behavior, output privacy,
+snapshot provenance, recovery planning, and explicit authorization for an isolated
+test. No command in this repository should be used to collect live snapshots for that
+purpose without a separate decision.
